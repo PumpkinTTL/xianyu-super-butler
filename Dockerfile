@@ -50,7 +50,8 @@ RUN apt-get update && \
         fonts-dejavu-core \
         fonts-liberation \
         libgl1 \
-        libglib2.0-0 && \
+        libglib2.0-0 \
+        nodejs && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
