@@ -205,7 +205,11 @@ class AIReplyEngine:
                 max_tokens=max_tokens,
                 temperature=temperature
             )
-            return response.choices[0].message.content.strip()
+            content = response.choices[0].message.content
+            if not content:
+                logger.warning(f"OpenAI API返回空content, finish_reason={response.choices[0].finish_reason}")
+                return ""
+            return content.strip()
         except Exception as e:
             status_code = getattr(getattr(e, 'response', None), 'status_code', None)
             logger.error(
@@ -443,14 +447,15 @@ class AIReplyEngine:
                 ]
 
                 reply = None # 初始化 reply 变量
+                ai_max_tokens = int(os.environ.get('AI_MAX_TOKENS', '2500'))
 
                 if self._is_dashscope_api(settings):
                     logger.info(f"使用DashScope API生成回复")
-                    reply = self._call_dashscope_api(settings, messages, max_tokens=100, temperature=0.7)
+                    reply = self._call_dashscope_api(settings, messages, max_tokens=ai_max_tokens, temperature=0.7)
                 
                 elif self._is_gemini_api(settings):
                     logger.info(f"使用Gemini API生成回复")
-                    reply = self._call_gemini_api(settings, messages, max_tokens=100, temperature=0.7)
+                    reply = self._call_gemini_api(settings, messages, max_tokens=ai_max_tokens, temperature=0.7)
                 
                 else:
                     logger.info(f"使用OpenAI兼容API生成回复")
@@ -458,7 +463,7 @@ class AIReplyEngine:
                     client = self._create_openai_client(cookie_id)
                     if not client:
                         return None
-                    reply = self._call_openai_api(client, settings, messages, max_tokens=100, temperature=0.7)
+                    reply = self._call_openai_api(client, settings, messages, max_tokens=ai_max_tokens, temperature=0.7)
 
                 reply = self._normalize_reply(reply)
                 if not reply:
