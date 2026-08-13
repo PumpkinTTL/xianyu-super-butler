@@ -21,7 +21,7 @@ import { confirmAction, notify } from '../services/feedback';
 import {
   Power, Edit2, Trash2, QrCode, X, Check, Loader2,
   MessageSquare, RefreshCw, Save, User, Clock, MessageCircle,
-  Key, Eye, EyeOff, Bot, Settings, MapPin, Users
+  Key, Eye, EyeOff, Bot, Settings, MapPin, Users, ExternalLink
 } from 'lucide-react';
 import { EmptyState, PageHeader, PageLoading } from './ui';
 
@@ -34,6 +34,7 @@ const AccountList: React.FC = () => {
   const [qrCodeUrl, setQrCodeUrl] = useState<string>('');
   const [qrStatus, setQrStatus] = useState<string>('pending');
   const [qrMessage, setQrMessage] = useState<string>('');
+  const [qrVerificationUrl, setQrVerificationUrl] = useState<string>('');
   const qrPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const qrSessionRef = useRef<string>('');
   const [activeModal, setActiveModal] = useState<ModalType>(null);
@@ -243,6 +244,7 @@ const AccountList: React.FC = () => {
   const startQRLogin = async () => {
     qrSessionRef.current = '';
     if (qrPollTimerRef.current) clearTimeout(qrPollTimerRef.current);
+    setQrVerificationUrl('');
     setShowQRModal(true);
     setQrStatus('loading');
     setQrMessage('');
@@ -295,6 +297,7 @@ const AccountList: React.FC = () => {
               return;
             } else if (statusRes.status === 'verification_required') {
               qrSessionRef.current = '';
+              setQrVerificationUrl(statusRes.verification_url || '');
               setQrStatus('error');
               setQrMessage(statusRes.message || '账号需要在手机上完成安全验证');
               return;
@@ -534,6 +537,17 @@ const AccountList: React.FC = () => {
                                   <div className="flex flex-col items-center px-4 text-center">
                                       <span className="mb-2 font-bold text-red-600">账号未登录完成</span>
                                       {qrMessage && <span className="mb-3 text-xs text-gray-500">{qrMessage}</span>}
+                                      {qrVerificationUrl && (
+                                        <a
+                                          href={qrVerificationUrl}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="ios-btn-primary mb-2 flex items-center gap-1.5 rounded-md px-3 py-2 text-xs"
+                                        >
+                                          <ExternalLink className="h-3.5 w-3.5" />
+                                          前往验证
+                                        </a>
+                                      )}
                                       <button
                                         type="button"
                                         onClick={startQRLogin}
