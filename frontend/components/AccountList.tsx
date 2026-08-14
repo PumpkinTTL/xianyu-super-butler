@@ -7,6 +7,8 @@ import {
   deleteAccount,
   generateQRLogin,
   checkQRLoginStatus,
+  passwordLogin,
+  checkPasswordLoginStatus,
   updateAccountRemark,
   updateAccountAutoConfirm,
   updateAccountPauseDuration,
@@ -23,7 +25,7 @@ import { confirmAction, notify } from '../services/feedback';
 import {
   Power, Edit2, Trash2, QrCode, X, Check, Loader2,
   MessageSquare, RefreshCw, Save, User, Clock, MessageCircle,
-  Key, Eye, EyeOff, Bot, Settings, MapPin, Users, ShieldCheck
+  Key, Eye, EyeOff, Bot, Settings, MapPin, Users, ShieldCheck, ExternalLink
 } from 'lucide-react';
 import { EmptyState, PageHeader, PageLoading } from './ui';
 
@@ -47,6 +49,14 @@ const AccountList: React.FC = () => {
   const [verificationUrl, setVerificationUrl] = useState<string>('');
   const qrPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const qrSessionRef = useRef<string>('');
+  const [showPasswordModal, setShowPasswordModal] = useState(false);
+  const [pwdForm, setPwdForm] = useState({ account: '', password: '', showPassword: false });
+  const [pwdStatus, setPwdStatus] = useState<string>('idle');
+  const [pwdMessage, setPwdMessage] = useState<string>('');
+  const [pwdVerificationUrl, setPwdVerificationUrl] = useState<string>('');
+  const [pwdScreenshotPath, setPwdScreenshotPath] = useState<string>('');
+  const pwdPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pwdSessionRef = useRef<string>('');
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [editingAccount, setEditingAccount] = useState<AccountDetail | null>(null);
   const [refreshingProfileId, setRefreshingProfileId] = useState<string | null>(null);
@@ -480,6 +490,89 @@ const AccountList: React.FC = () => {
     setShowQRModal(false);
   };
 
+  const startPasswordLogin = async () => {
+    if (!pwdForm.account || !pwdForm.password) {
+      setPwdStatus('error');
+      setPwdMessage('请输入闲鱼账号和密码');
+      return;
+    }
+    if (pwdPollTimerRef.current) clearTimeout(pwdPollTimerRef.current);
+    setPwdStatus('processing');
+    setPwdMessage('正在启动登录...');
+    setPwdVerificationUrl('');
+    setPwdScreenshotPath('');
+    try {
+      const res = await passwordLogin({
+        account: pwdForm.account.trim(),
+        password: pwdForm.password,
+        show_browser: false,
+      });
+      if (!res.success || !res.session_id) {
+        setPwdStatus('error');
+        setPwdMessage(res.message || '登录启动失败');
+        return;
+      }
+      pwdSessionRef.current = res.session_id;
+      const pollStatus = async () => {
+        if (pwdSessionRef.current !== res.session_id) return;
+        try {
+          const statusRes = await checkPasswordLoginStatus(res.session_id!);
+          if (pwdSessionRef.current !== res.session_id) return;
+
+          if (statusRes.status === 'success') {
+            pwdSessionRef.current = '';
+            setPwdStatus('success');
+            setPwdMessage(statusRes.message || '账号登录成功');
+            setTimeout(() => {
+              setShowPasswordModal(false);
+              loadAccounts();
+            }, 1200);
+            return;
+          }
+          if (statusRes.status === 'verification_required') {
+            setPwdStatus('verification_required');
+            setPwdMessage(statusRes.message || '需要完成安全验证');
+            setPwdVerificationUrl(statusRes.verification_url || '');
+            setPwdScreenshotPath(statusRes.screenshot_path || '');
+            return;
+          }
+          if (statusRes.status === 'failed' || statusRes.status === 'error') {
+            pwdSessionRef.current = '';
+            setPwdStatus('error');
+            setPwdMessage(statusRes.message || '登录失败');
+            return;
+          }
+          if (statusRes.status === 'not_found') {
+            pwdSessionRef.current = '';
+            setPwdStatus('error');
+            setPwdMessage('登录会话已过期，请重试');
+            return;
+          }
+          setPwdMessage(statusRes.message || '登录处理中，请稍候...');
+          pwdPollTimerRef.current = setTimeout(pollStatus, 2500);
+        } catch (error) {
+          pwdSessionRef.current = '';
+          setPwdStatus('error');
+          setPwdMessage(error instanceof Error ? error.message : '登录状态查询失败');
+        }
+      };
+      pwdPollTimerRef.current = setTimeout(pollStatus, 3000);
+    } catch (e) {
+      setPwdStatus('error');
+      setPwdMessage(e instanceof Error ? e.message : '登录启动请求失败');
+    }
+  };
+
+  const closePasswordModal = () => {
+    pwdSessionRef.current = '';
+    if (pwdPollTimerRef.current) clearTimeout(pwdPollTimerRef.current);
+    setShowPasswordModal(false);
+    setPwdStatus('idle');
+    setPwdMessage('');
+    setPwdVerificationUrl('');
+    setPwdScreenshotPath('');
+  };
+
   const getRuntimeBadge = (account: AccountDetail) => {
     if (!account.enabled) {
       return { label: '已暂停', className: 'bg-gray-100 text-gray-500' };
@@ -519,13 +612,22 @@ const AccountList: React.FC = () => {
         icon={Users}
         badge={<span className="status-badge status-badge-info">{accounts.length} 个账号</span>}
         actions={(
-          <button
-            onClick={startQRLogin}
-            className="ios-btn-primary flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm"
-          >
-            <QrCode className="h-4 w-4" />
-            扫码添加账号
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowPasswordModal(true)}
+              className="ios-btn-secondary flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm"
+            >
+              <Key className="h-4 w-4" />
+              账号密码登录
+            </button>
+            <button
+              onClick={startQRLogin}
+              className="ios-btn-primary flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm"
+            >
+              <QrCode className="h-4 w-4" />
+              扫码添加账号
+            </button>
+          </div>
         )}
       />
 
@@ -757,6 +859,133 @@ const AccountList: React.FC = () => {
               </div>
           </div>,
           document.body
+      )}
+
+      {/* 账号密码登录弹窗 */}
+      {showPasswordModal && createPortal(
+        <div className="modal-overlay">
+          <div className="modal-container" style={{maxWidth: '26rem'}}>
+            <div className="modal-header flex items-start justify-between gap-4">
+              <div>
+                <h3 className="text-lg font-bold text-gray-900">账号密码登录</h3>
+                <p className="mt-1 text-xs text-gray-500">使用闲鱼账号和密码登录，滑块验证将自动处理。</p>
+              </div>
+              <button
+                type="button"
+                onClick={closePasswordModal}
+                className="rounded-md p-2 hover:bg-gray-100"
+                aria-label="关闭账号密码登录"
+              >
+                <X className="h-5 w-5 text-gray-600" />
+              </button>
+            </div>
+
+            <div className="modal-body space-y-4">
+              {pwdStatus === 'idle' && (
+                <>
+                  <div>
+                    <label className="mb-1 block text-xs font-bold text-gray-700">闲鱼账号（手机号）</label>
+                    <input
+                      type="text"
+                      value={pwdForm.account}
+                      onChange={(e) => setPwdForm({ ...pwdForm, account: e.target.value })}
+                      placeholder="请输入手机号"
+                      className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs font-bold text-gray-700">密码</label>
+                    <div className="relative">
+                      <input
+                        type={pwdForm.showPassword ? 'text' : 'password'}
+                        value={pwdForm.password}
+                        onChange={(e) => setPwdForm({ ...pwdForm, password: e.target.value })}
+                        placeholder="请输入密码"
+                        className="ios-input w-full rounded-md px-3 py-2.5 pr-10 text-sm"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setPwdForm({ ...pwdForm, showPassword: !pwdForm.showPassword })}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-gray-400 hover:text-gray-600"
+                        aria-label="显示密码"
+                      >
+                        {pwdForm.showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                      </button>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={startPasswordLogin}
+                    className="ios-btn-primary flex w-full items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm"
+                  >
+                    <Key className="h-4 w-4" />
+                    开始登录
+                  </button>
+                </>
+              )}
+
+              {pwdStatus === 'processing' && (
+                <div className="flex flex-col items-center py-6 text-center">
+                  <Loader2 className="mb-3 h-8 w-8 animate-spin text-amber-500" />
+                  <span className="text-sm font-bold text-gray-800">正在登录，请稍候...</span>
+                  {pwdMessage && <span className="mt-2 text-xs text-gray-500">{pwdMessage}</span>}
+                  <p className="mt-3 text-xs text-gray-400">首次登录可能需要 1-2 分钟，遇到滑块验证会自动处理。</p>
+                </div>
+              )}
+
+              {pwdStatus === 'verification_required' && (
+                <div className="flex flex-col items-center py-4 text-center">
+                  <ShieldCheck className="mb-3 h-10 w-10 text-amber-600" />
+                  <span className="text-sm font-bold text-amber-800">需要完成安全验证</span>
+                  {pwdMessage && <span className="mt-1 text-xs text-gray-500">{pwdMessage}</span>}
+                  {pwdVerificationUrl && (
+                    <a
+                      href={pwdVerificationUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="ios-btn-primary mt-4 flex items-center gap-1.5 rounded-md px-3 py-2 text-xs"
+                    >
+                      <ExternalLink className="h-3.5 w-3.5" />
+                      打开验证页面
+                    </a>
+                  )}
+                  <button
+                    type="button"
+                    onClick={startPasswordLogin}
+                    className="ios-btn-secondary mt-2 flex items-center gap-1.5 rounded-md px-3 py-2 text-xs"
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    验证完成后重新检测
+                  </button>
+                </div>
+              )}
+
+              {pwdStatus === 'success' && (
+                <div className="flex flex-col items-center py-6 text-center">
+                  <Check className="mb-3 h-10 w-10 text-green-600" />
+                  <span className="text-base font-bold text-green-700">登录成功</span>
+                  <span className="mt-1 text-xs text-gray-500">{pwdMessage}</span>
+                </div>
+              )}
+
+              {pwdStatus === 'error' && (
+                <div className="flex flex-col items-center py-6 text-center">
+                  <span className="mb-2 font-bold text-red-600">登录失败</span>
+                  {pwdMessage && <span className="mb-3 text-xs text-gray-500">{pwdMessage}</span>}
+                  <button
+                    type="button"
+                    onClick={() => { setPwdStatus('idle'); setPwdMessage(''); }}
+                    className="ios-btn-secondary flex items-center gap-1.5 rounded-md px-3 py-2 text-xs"
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    返回重试
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>,
+        document.body
       )}
 
       {/* 编辑账号弹窗 */}
