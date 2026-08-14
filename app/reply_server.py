@@ -2878,11 +2878,26 @@ async def _enhance_qr_login_cookies(
             cookie_id=account_id,
             user_id=user_id,
         )
-        refresh_success = await temp_instance.refresh_cookies_from_qr_login(
-            qr_cookies_str=cookies,
-            cookie_id=account_id,
-            user_id=user_id,
-        )
+        # Playwright 是同步阻塞操作，必须在独立线程的独立事件循环中执行，
+        # 否则驱动卡死时会阻塞主服务 event loop，导致整个后台无响应。
+        def _run_refresh_in_thread():
+            import asyncio as _aio
+            new_loop = _aio.new_event_loop()
+            try:
+                return new_loop.run_until_complete(
+                    temp_instance.refresh_cookies_from_qr_login(
+                        qr_cookies_str=cookies,
+                        cookie_id=account_id,
+                        user_id=user_id,
+                    )
+                )
+            finally:
+                try:
+                    new_loop.close()
+                except Exception:
+                    pass
+
+        refresh_success = await asyncio.to_thread(_run_refresh_in_thread)
         if refresh_success:
             updated_cookie_info = db_manager.get_cookie_by_id(account_id)
             refreshed_cookies = (
