@@ -533,7 +533,9 @@ const AccountList: React.FC = () => {
             setPwdStatus('verification_required');
             setPwdMessage(statusRes.message || '需要完成安全验证');
             setPwdVerificationUrl(statusRes.verification_url || '');
-            setPwdScreenshotPath(statusRes.screenshot_path || '');
+            const rawPath = statusRes.screenshot_path || '';
+            const fileName = rawPath.split('/').pop();
+            setPwdScreenshotPath(fileName ? `/static/uploads/images/${fileName}` : '');
             return;
           }
           if (statusRes.status === 'failed' || statusRes.status === 'error') {
@@ -938,6 +940,13 @@ const AccountList: React.FC = () => {
                   <ShieldCheck className="mb-3 h-10 w-10 text-amber-600" />
                   <span className="text-sm font-bold text-amber-800">需要完成安全验证</span>
                   {pwdMessage && <span className="mt-1 text-xs text-gray-500">{pwdMessage}</span>}
+                  {pwdScreenshotPath && (
+                    <img
+                      src={pwdScreenshotPath}
+                      alt="验证截图"
+                      className="mt-3 max-h-60 w-full rounded-md border border-gray-200 object-contain"
+                    />
+                  )}
                   {pwdVerificationUrl && (
                     <a
                       href={pwdVerificationUrl}
