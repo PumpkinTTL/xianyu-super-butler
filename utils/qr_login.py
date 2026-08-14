@@ -313,7 +313,7 @@ class QRLoginManager:
             logger.info(f"开始监控二维码状态: {session_id}")
 
             # 监控登录状态
-            max_wait_time = 300  # 5分钟
+            max_wait_time = 900  # 15分钟（含风控验证等待时间）
             start_time = time.time()
 
             while time.time() - start_time < max_wait_time:
@@ -348,16 +348,18 @@ class QRLoginManager:
                             is True
                         ):
                             # 账号被风控，需要手机验证
-                            session.status = 'verification_required'
-                            iframe_url = (
-                                resp.json()
-                                .get("content", {})
-                                .get("data", {})
-                                .get("iframeRedirectUrl")
-                            )
-                            session.verification_url = iframe_url
-                            logger.warning(f"账号被风控，需要手机验证: {session_id}, URL: {iframe_url}")
-                            break
+                            if session.status != 'verification_required':
+                                session.status = 'verification_required'
+                                iframe_url = (
+                                    resp.json()
+                                    .get("content", {})
+                                    .get("data", {})
+                                    .get("iframeRedirectUrl")
+                                )
+                                session.verification_url = iframe_url
+                                logger.warning(f"账号被风控，需要手机验证: {session_id}, URL: {iframe_url}")
+                            # 不break，继续轮询，等待用户完成验证后闲鱼放行该会话
+                            continue
                         else:
                             # 登录成功
                             session.status = 'success'
