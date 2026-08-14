@@ -55,6 +55,7 @@ const AccountList: React.FC = () => {
   const [pwdMessage, setPwdMessage] = useState<string>('');
   const [pwdVerificationUrl, setPwdVerificationUrl] = useState<string>('');
   const [pwdScreenshotPath, setPwdScreenshotPath] = useState<string>('');
+  const [pwdVerificationQrUrl, setPwdVerificationQrUrl] = useState<string>('');
   const pwdPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pwdSessionRef = useRef<string>('');
   const [activeModal, setActiveModal] = useState<ModalType>(null);
@@ -533,6 +534,7 @@ const AccountList: React.FC = () => {
             setPwdStatus('verification_required');
             setPwdMessage(statusRes.message || '需要完成安全验证');
             setPwdVerificationUrl(statusRes.verification_url || '');
+            setPwdVerificationQrUrl(statusRes.verification_qr_code_url || '');
             const rawPath = statusRes.screenshot_path || '';
             const fileName = rawPath.split('/').pop();
             setPwdScreenshotPath(fileName ? `/static/uploads/images/${fileName}` : '');
@@ -940,13 +942,22 @@ const AccountList: React.FC = () => {
                   <ShieldCheck className="mb-3 h-10 w-10 text-amber-600" />
                   <span className="text-sm font-bold text-amber-800">需要完成安全验证</span>
                   {pwdMessage && <span className="mt-1 text-xs text-gray-500">{pwdMessage}</span>}
-                  {pwdScreenshotPath && (
+                  {pwdVerificationQrUrl ? (
+                    <>
+                      <img
+                        src={pwdVerificationQrUrl}
+                        alt="人脸验证二维码"
+                        className="mt-3 h-48 w-48 rounded-md border border-gray-200 object-contain"
+                      />
+                      <p className="mt-2 text-xs text-gray-500">请使用闲鱼 App 扫码完成人脸验证</p>
+                    </>
+                  ) : pwdScreenshotPath ? (
                     <img
                       src={pwdScreenshotPath}
                       alt="验证截图"
                       className="mt-3 max-h-60 w-full rounded-md border border-gray-200 object-contain"
                     />
-                  )}
+                  ) : null}
                   {pwdVerificationUrl && (
                     <a
                       href={pwdVerificationUrl}

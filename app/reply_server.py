@@ -2375,13 +2375,29 @@ async def check_password_login_status(
             # 需要人脸认证
             screenshot_path = session.get('screenshot_path')
             verification_url = session.get('verification_url')
-            return {
+            result = {
                 'status': 'verification_required',
                 'verification_url': verification_url,
                 'screenshot_path': screenshot_path,
                 'qr_code_url': session.get('qr_code_url'),  # 保留兼容性
                 'message': '需要人脸验证，请查看验证截图' if screenshot_path else '需要人脸验证，请点击验证链接'
             }
+            # 有验证链接时生成验证二维码，方便手机扫码完成人脸验证
+            if verification_url:
+                try:
+                    import qrcode
+                    import base64
+                    import io
+                    qr_image = qrcode.make(verification_url)
+                    qr_buffer = io.BytesIO()
+                    qr_image.save(qr_buffer, format='PNG')
+                    result['verification_qr_code_url'] = (
+                        'data:image/png;base64,' + base64.b64encode(qr_buffer.getvalue()).decode('ascii')
+                    )
+                    log_with_user('debug', f"已生成人脸验证二维码: {session_id}", current_user)
+                except Exception as qr_err:
+                    log_with_user('warning', f"生成人脸验证二维码失败: {str(qr_err)}", current_user)
+            return result
         elif status == 'success':
             # 登录成功
             # 删除截图（如果存在）
