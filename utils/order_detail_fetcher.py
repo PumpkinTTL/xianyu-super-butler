@@ -10,9 +10,7 @@ import os
 from typing import Optional, Dict, Any
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from loguru import logger
-import re
-import json
-from threading import Lock
+from utils import browser_limit
 from collections import defaultdict
 from app.specification import (
     canonicalize_specification,
@@ -158,9 +156,10 @@ class OrderDetailFetcher:
                 ])
 
             logger.info(f"启动浏览器，参数: {browser_args}")
-            self.browser = await playwright.chromium.launch(
-                headless=headless,
-                args=browser_args
+            self.browser = await browser_limit.launch_browser(
+                playwright,
+                {'headless': headless, 'args': browser_args},
+                "订单详情抓取",
             )
 
             logger.info("浏览器启动成功，创建上下文...")

@@ -15,18 +15,19 @@ import tempfile
 import shutil
 from datetime import datetime
 from playwright.sync_api import sync_playwright, ElementHandle
-from typing import Optional, Tuple, List, Dict, Any, Callable
+from typing import Optional, List, Dict, Any, Callable
 from loguru import logger
-from collections import defaultdict
+
+from utils import browser_limit
 
 # 导入配置
 try:
     from app.config import SLIDER_VERIFICATION
-    SLIDER_MAX_CONCURRENT = SLIDER_VERIFICATION.get('max_concurrent', 3)
+    SLIDER_MAX_CONCURRENT = SLIDER_VERIFICATION.get('max_concurrent', 1)
     SLIDER_WAIT_TIMEOUT = SLIDER_VERIFICATION.get('wait_timeout', 60)
 except ImportError:
     # 如果无法导入配置，使用默认值
-    SLIDER_MAX_CONCURRENT = 3
+    SLIDER_MAX_CONCURRENT = 1
     SLIDER_WAIT_TIMEOUT = 60
 
 # 使用loguru日志库，与主程序保持一致
@@ -251,6 +252,7 @@ class XianyuSliderStealth:
         self.page = None
         self.context = None
         self.playwright = None
+        self._browser_slot_held = False  # 是否占用着全局浏览器槽位
         
         # 提取纯用户ID（移除时间戳部分）
         self.pure_user_id = concurrency_manager._extract_pure_user_id(user_id)
@@ -310,6 +312,13 @@ class XianyuSliderStealth:
     def init_browser(self):
         """初始化浏览器 - 增强反检测版本"""
         try:
+            # 占用一个浏览器槽位，close_browser 时归还。
+            # 多账号同时触发滑块时，弱 CPU 机器上并发拉起 Chrome 会互相拖慢，
+            # 反而更容易验证失败。
+            if not self._browser_slot_held:
+                browser_limit.acquire_slot("滑块验证")
+                self._browser_slot_held = True
+
             # 启动 Playwright
             logger.info(f"【{self.pure_user_id}】启动Playwright...")
             self.playwright = sync_playwright().start()
@@ -1411,7 +1420,6 @@ class XianyuSliderStealth:
     def _simulate_human_page_behavior(self):
         """模拟人类在验证页面的前置行为 - 极速模式已禁用"""
         # 极速模式：不进行页面行为模拟，直接开始滑动
-        pass
     
     def find_slider_elements(self, fast_mode=False):
         """查找滑块元素（支持在主页面和所有frame中查找）
@@ -1628,7 +1636,6 @@ class XianyuSliderStealth:
                         except Exception as vis_e:
                             # 如果无法检查可见性，仍然使用该元素
                             logger.debug(f"【{self.pure_user_id}】无法检查元素可见性: {vis_e}，继续使用该元素")
-                            pass
                     
                     if element:
                         frame_info = "主页面" if search_frame == self.page else f"Frame"
@@ -2520,6 +2527,11 @@ class XianyuSliderStealth:
                 self.temp_dir = None  # 设置为None，防止重复清理
         except Exception as e:
             logger.warning(f"【{self.pure_user_id}】清理临时目录时出错: {e}")
+
+        # 归还浏览器槽位。放在最后，确保浏览器进程确实退出后才放行下一个任务。
+        if self._browser_slot_held:
+            self._browser_slot_held = False
+            browser_limit.release_slot("滑块验证")
         
         # 注销实例（最后执行，确保其他清理完成）
         try:
@@ -3069,6 +3081,9 @@ class XianyuSliderStealth:
         Returns:
             dict: Cookie字典，失败返回None
         """
+        # 槽位是否已占用。在 try 之前定义，确保后面任何异常路径的 finally
+        # 都能安全读到它。
+        password_login_slot_held = False
         try:
             # 检查日期有效性
             if not self._check_date_validity():
@@ -3129,7 +3144,10 @@ class XianyuSliderStealth:
                             logger.info(f"【{self.pure_user_id}】使用浏览器版本: {chromium_dir.name}")
                             break
             
-            # 启动浏览器
+            # 启动浏览器。先占槽位：这条路径由用户手动触发，但后台的 Cookie
+            # 刷新、滑块验证同样在抢 CPU，弱机上并存会让登录变得更慢更易失败。
+            browser_limit.acquire_slot("密码登录")
+            password_login_slot_held = True
             playwright = sync_playwright().start()
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir,
@@ -3966,6 +3984,10 @@ class XianyuSliderStealth:
                         playwright.stop()
                     except:
                         pass
+                finally:
+                    if password_login_slot_held:
+                        password_login_slot_held = False
+                        browser_limit.release_slot("密码登录")
         
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】密码登录流程异常: {e}")

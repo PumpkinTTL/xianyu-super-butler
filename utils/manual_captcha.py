@@ -17,6 +17,7 @@ import time
 from typing import Any, Dict, Optional
 
 from loguru import logger
+from utils import browser_limit
 
 LOGIN_URL = "https://www.goofish.com/"
 
@@ -39,7 +40,6 @@ def get_verification_url(cookie_id: str) -> Optional[str]:
     兜底：会话内若触发实时 Token 刷新拿到新 URL 更好，拿不到才用它。
     """
     import re
-    import sqlite3
     from app.db_manager import db_manager
 
     try:
@@ -178,14 +178,20 @@ async def open_manual_session(
     refresh_task = None
     try:
         playwright = await async_playwright().start()
-        browser = await playwright.chromium.launch(
-            headless=headless,
-            args=[
+        browser = await browser_limit.launch_browser(
+            playwright,
+            {'headless': headless,
+             # 只用完整版 Chromium。headless=True 默认会去找单独下载的
+             # chromium_headless_shell，缺失时报 Executable doesn't exist，
+             # 人工验证页面就会卡在「正在服务器上打开验证页面」。
+             'channel': 'chromium',
+             'args': [
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
-            ],
+            ]},
+            "人工验证码",
         )
         context = await browser.new_context(
             viewport={"width": 1280, "height": 800},

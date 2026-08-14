@@ -7,6 +7,7 @@ import os
 import random
 from enum import Enum
 from loguru import logger
+from utils import browser_limit
 import websockets
 from utils.xianyu_utils import (
     decrypt, generate_mid, generate_uuid, trans_cookies,
@@ -3384,6 +3385,12 @@ class XianyuLive:
         launch_options = {
             'headless': True,
             'args': browser_args,
+            # 显式指定完整版 Chromium。headless=True 时 Playwright 会优先找
+            # chromium_headless_shell-*，那是与 chromium-* 分开下载的另一份文件；
+            # 下载中断时常常只装上其中一个，于是出现「自检说浏览器已安装、
+            # 真正启动却报 Executable doesn't exist」。指定 channel 后只依赖
+            # 完整版，与下方 executable_path 的检查也就对得上了。
+            'channel': 'chromium',
         }
         bundled_executable = playwright.chromium.executable_path
         if os.path.exists(bundled_executable):
@@ -3412,6 +3419,8 @@ class XianyuLive:
 
         browser_name, browser_path = system_browser
         launch_options['executable_path'] = browser_path
+        # 指定了自定义可执行文件就不能再带 channel，两者互斥
+        launch_options.pop('channel', None)
         logger.warning(
             f"【{self.cookie_id}】{purpose}的Playwright Chromium未安装，"
             f"回退使用系统{browser_name}: {browser_path}"
@@ -3655,7 +3664,7 @@ class XianyuLive:
                 browser_args,
                 "账号资料抓取",
             )
-            browser = await playwright.chromium.launch(**launch_options)
+            browser = await browser_limit.launch_browser(playwright, launch_options, "账号资料抓取")
             context = await browser.new_context(
                 viewport={'width': 1440, 'height': 900},
                 user_agent=(
@@ -3807,7 +3816,7 @@ class XianyuLive:
                 browser_args,
                 "商品详情获取"
             )
-            browser = await playwright.chromium.launch(**launch_options)
+            browser = await browser_limit.launch_browser(playwright, launch_options, "商品详情获取")
 
             # 创建浏览器上下文
             context = await browser.new_context(
@@ -3978,7 +3987,6 @@ class XianyuLive:
         success_count = 0
 
         try:
-            from app.db_manager import db_manager
             from app.config import config
 
             # 从配置获取并发数量和延迟时间
@@ -4681,7 +4689,6 @@ class XianyuLive:
         """发送消息通知"""
         try:
             from app.db_manager import db_manager
-            import aiohttp
             import hashlib
 
             # 过滤系统默认消息，不发送通知
@@ -4806,7 +4813,6 @@ class XianyuLive:
         """发送钉钉通知"""
         try:
             import aiohttp
-            import json
             import hmac
             import hashlib
             import base64
@@ -4929,7 +4935,6 @@ class XianyuLive:
         try:
             import aiohttp
             import json
-            from urllib.parse import quote
 
             logger.info("📱 Bark通知 - 开始处理")
 
@@ -5190,7 +5195,6 @@ class XianyuLive:
         """发送微信通知"""
         try:
             import aiohttp
-            import json
 
             # 解析配置
             webhook_url = config_data.get('webhook_url', '')
@@ -7836,7 +7840,7 @@ class XianyuLive:
                 )
 
             logger.info(f"【{target_cookie_id}】正在启动无头浏览器")
-            browser = await playwright.chromium.launch(**launch_options)
+            browser = await browser_limit.launch_browser(playwright, launch_options, "扫码登录")
             logger.info(f"【{target_cookie_id}】无头浏览器启动成功")
 
             # 创建浏览器上下文
@@ -8173,7 +8177,7 @@ class XianyuLive:
                 browser_args,
                 "浏览器页面刷新"
             )
-            browser = await playwright.chromium.launch(**launch_options)
+            browser = await browser_limit.launch_browser(playwright, launch_options, "浏览器页面刷新")
 
             # 创建浏览器上下文
             context_options = {
@@ -8480,7 +8484,7 @@ class XianyuLive:
                 browser_args,
                 "定时Cookie刷新"
             )
-            browser = await playwright.chromium.launch(**launch_options)
+            browser = await browser_limit.launch_browser(playwright, launch_options, "定时Cookie刷新")
 
             # 创建浏览器上下文
             context_options = {
@@ -11036,7 +11040,6 @@ class XianyuLive:
 
             if image_url:
                 # 获取图片信息
-                from utils.image_utils import image_manager
                 try:
                     from PIL import Image
                     with Image.open(image_path) as img:
