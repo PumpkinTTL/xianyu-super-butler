@@ -60,6 +60,7 @@ class QRLoginSession:
         self.expire_time = 300  # 5分钟过期
         self.params = {}  # 存储登录参数
         self.verification_url = None  # 风控验证URL
+        self.face_qr_url = None  # 人脸验证二维码 (base64 data-url)
         self.last_remote_status = None
 
     def is_expired(self) -> bool:
@@ -82,6 +83,7 @@ class QRLoginManager:
 
     def __init__(self):
         self.sessions: Dict[str, QRLoginSession] = {}
+        self._face_tasks: set = set()  # 人脸验证后台任务强引用
         self.headers = generate_headers()
         self.host = "https://passport.goofish.com"
         self.api_mini_login = f"{self.host}/mini_login.htm"
@@ -347,7 +349,7 @@ class QRLoginManager:
                             .get("iframeRedirect")
                             is True
                         ):
-                            # 账号被风控，需要手机验证
+                            # 账号被风控，需要人脸验证
                             session.status = 'verification_required'
                             iframe_url = (
                                 resp.json()
@@ -356,7 +358,20 @@ class QRLoginManager:
                                 .get("iframeRedirectUrl")
                             )
                             session.verification_url = iframe_url
-                            logger.warning(f"账号被风控，需要手机验证: {session_id}, URL: {iframe_url}")
+                            # 保留本次 query.do 响应的 Cookie(身份锚点)，供人脸验证链路复用
+                            for k, v in resp.cookies.items():
+                                session.cookies[k] = v
+                            # 重置会话有效期窗口，避免调度间隙被误判为过期
+                            session.created_time = time.time()
+                            session.expire_time = 900
+                            logger.warning(f"账号被风控，启动人脸验证链路: {session_id}, URL: {iframe_url}")
+                            # 启动后台人脸验证任务（纯 API，自动抓取人脸二维码并轮询完成）
+                            from utils.qr_login_face_verification import run_face_verification
+                            task = asyncio.create_task(
+                                run_face_verification(self, session_id, iframe_url)
+                            )
+                            self._face_tasks.add(task)
+                            task.add_done_callback(self._face_tasks.discard)
                             break
                         else:
                             # 登录成功
