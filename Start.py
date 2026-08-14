@@ -185,22 +185,44 @@ def _check_and_install_playwright():
                     playwright_installed = True
                     return True
     
+    # 镜像和自定义安装都靠这个环境变量指定浏览器位置（容器里是 /ms-playwright）。
+    # 不先看它就会一路找不到，最后靠"真的启动一次浏览器"来判断有没有装，
+    # 在低配设备上这一次多余的冷启动就够把内存顶到 OOM。
+    env_browsers_path = os.getenv('PLAYWRIGHT_BROWSERS_PATH')
+    if env_browsers_path and env_browsers_path not in ('0', 'false'):
+        possible_paths.append(Path(env_browsers_path))
+
     # Windows上的常见位置
     if sys.platform == 'win32':
         # 用户缓存目录
         user_cache = Path.home() / '.cache' / 'ms-playwright'
         possible_paths.append(user_cache)
-        
+
         # LocalAppData目录
         local_appdata = os.getenv('LOCALAPPDATA')
         if local_appdata:
             possible_paths.append(Path(local_appdata) / 'ms-playwright')
-        
+
         # AppData目录
         appdata = os.getenv('APPDATA')
         if appdata:
             possible_paths.append(Path(appdata) / 'ms-playwright')
-    
+    elif sys.platform == 'darwin':
+        possible_paths.append(Path.home() / 'Library' / 'Caches' / 'ms-playwright')
+    else:
+        possible_paths.append(Path.home() / '.cache' / 'ms-playwright')
+
+    # 各平台的浏览器可执行文件相对路径。
+    # 新版 Playwright 在 macOS 上改用 Chrome for Testing，旧版是 Chromium。
+    browser_exe_candidates = (
+        Path('chrome-win') / 'chrome.exe',
+        Path('chrome-mac') / 'Chromium.app' / 'Contents' / 'MacOS' / 'Chromium',
+        Path('chrome-mac-arm64') / 'Chromium.app' / 'Contents' / 'MacOS' / 'Chromium',
+        Path('chrome-mac') / 'Google Chrome for Testing.app' / 'Contents' / 'MacOS' / 'Google Chrome for Testing',
+        Path('chrome-mac-arm64') / 'Google Chrome for Testing.app' / 'Contents' / 'MacOS' / 'Google Chrome for Testing',
+        Path('chrome-linux') / 'chrome',
+    )
+
     # 检查是否存在chromium浏览器
     for path in possible_paths:
         if path.exists():
@@ -208,13 +230,15 @@ def _check_and_install_playwright():
             chromium_dirs = list(path.glob('chromium-*'))
             if chromium_dirs:
                 for chromium_dir in chromium_dirs:
-                    chrome_win = chromium_dir / 'chrome-win'
-                    chrome_exe = chrome_win / 'chrome.exe'
-                    if chrome_exe.exists():
-                        print(f"{_OK} 找到Playwright浏览器: {chrome_exe}")
-                        # 设置环境变量
-                        os.environ['PLAYWRIGHT_BROWSERS_PATH'] = str(path)
-                        playwright_installed = True
+                    for relative_exe in browser_exe_candidates:
+                        browser_exe = chromium_dir / relative_exe
+                        if browser_exe.exists():
+                            print(f"{_OK} 找到Playwright浏览器: {browser_exe}")
+                            # 设置环境变量
+                            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = str(path)
+                            playwright_installed = True
+                            break
+                    if playwright_installed:
                         break
                 if playwright_installed:
                     break
@@ -432,11 +456,56 @@ except Exception as e:
     print("   程序将继续启动，但Playwright功能可能不可用")
     # 继续启动，不影响主程序运行
 
+
+def _verify_browser_launchable():
+    """启动时实际拉起一次浏览器，确认版本匹配。
+
+    仅检查目录存在是不够的：playwright 与 Chromium revision 强绑定，
+    版本不匹配时 launch 会报 "Executable doesn't exist"。此时滑块验证、
+    扫码登录、账号资料抓取会全部静默失效 —— 滑块处理在 0.3 秒内就崩掉，
+    看日志只会看到"验证失败"，很难联想到是浏览器问题。
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print(f"{_WARN} 未安装 playwright，滑块验证与扫码登录将不可用")
+        return False
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            browser.close()
+        print(f"{_OK} 浏览器自检通过，滑块验证与扫码登录可用")
+        return True
+    except Exception as exc:
+        detail = str(exc)
+        print(f"{_ERROR} 浏览器无法启动，滑块验证与扫码登录将失效！")
+        if "Executable doesn't exist" in detail:
+            print("   原因：playwright 版本与已安装的 Chromium 不匹配")
+            print("   修复：python -m playwright install chromium")
+        else:
+            print(f"   详情：{detail[:200]}")
+        print("   注意：验证码处理失效会导致 Token 刷新持续失败并加剧平台风控")
+        return False
+
+
+try:
+    _verify_browser_launchable()
+except Exception as e:
+    print(f"{_WARN} 浏览器自检异常: {e}")
+
 # ==================== 自动构建前端 ====================
 def _build_frontend():
     """自动安装依赖并构建前端"""
     frontend_dir = Path("frontend")
     static_dir = Path("static")
+
+    # 容器镜像在构建阶段就已经把前端产物放进 static/，运行时既没有 npm 也没有
+    # node_modules。这里再走一遍只会白等一次 npm 失败，低配设备上还要多花几十秒，
+    # 所以直接跳过。
+    if os.getenv('DOCKER_ENV', '').lower() in ('1', 'true', 'yes'):
+        print(f"{_INFO} 容器环境，前端已在镜像构建阶段生成，跳过构建")
+        return True
 
     if not frontend_dir.exists():
         print(f"{_WARN} frontend 目录不存在，跳过前端构建")
@@ -453,15 +522,21 @@ def _build_frontend():
         need_build = True
         print(f"{_INFO} static/index.html 不存在，需要构建前端")
     else:
+        # 必须在进入目录前剪枝：node_modules 动辄几万个文件，rglob 会先把它们
+        # 全部走一遍再过滤，在 NAS 的机械盘或 overlay 文件系统上能卡住好几分钟，
+        # 看起来就像"启动卡死、资源打满"。
         ignored_dirs = {"node_modules", "dist", ".vite"}
-        source_files = [
-            path for path in frontend_dir.rglob("*")
-            if path.is_file() and not ignored_dirs.intersection(path.parts)
-        ]
-        latest_source_mtime = max(
-            (path.stat().st_mtime for path in source_files),
-            default=0
-        )
+        latest_source_mtime = 0.0
+        for root, dirs, files in os.walk(build_dir):
+            dirs[:] = [d for d in dirs if d not in ignored_dirs]
+            for name in files:
+                try:
+                    mtime = os.stat(os.path.join(root, name)).st_mtime
+                except OSError:
+                    continue
+                if mtime > latest_source_mtime:
+                    latest_source_mtime = mtime
+
         if latest_source_mtime > index_html.stat().st_mtime:
             need_build = True
             print(f"{_INFO} 前端源码比构建产物新，需要重新构建")
@@ -710,9 +785,57 @@ async def main():
     threading.Thread(target=_start_api_server, daemon=True).start()
     print("API 服务线程已启动")
 
+    # 启动数据库自动备份：全局一份，不随账号数量重复
+    print("启动数据库自动备份任务...")
+    asyncio.create_task(_db_backup_loop())
+
     # 阻塞保持运行
     print("主程序启动完成，保持运行...")
     await asyncio.Event().wait()
+
+
+async def _db_backup_loop():
+    """数据库定时备份。
+
+    SQLite 是单文件存储，损坏或误删就全部丢失，因此默认开启。
+    间隔和保留份数可在系统设置里调整。
+    """
+    from app.db_manager import db_manager
+    from utils.db_backup import create_backup
+
+    while True:
+        try:
+            enabled_str = db_manager.get_system_setting('db_backup_enabled')
+            interval_str = db_manager.get_system_setting('db_backup_interval')
+            keep_str = db_manager.get_system_setting('db_backup_keep')
+
+            # 默认开启：备份没有副作用，出问题时能救命
+            enabled = str(enabled_str or '').strip().lower() != 'false'
+            try:
+                interval = int(interval_str) if interval_str else 86400
+            except (TypeError, ValueError):
+                interval = 86400
+            interval = max(3600, interval)
+            try:
+                keep = int(keep_str) if keep_str else 7
+            except (TypeError, ValueError):
+                keep = 7
+
+            if not enabled:
+                await asyncio.sleep(600)
+                continue
+
+            result = create_backup(keep=max(1, keep))
+            if not result['success']:
+                logger.warning(f"数据库自动备份失败: {result['message']}")
+
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            logger.info("数据库自动备份任务已取消")
+            raise
+        except Exception as e:
+            logger.error(f"数据库自动备份异常: {e}")
+            await asyncio.sleep(600)
 
 
 if __name__ == '__main__':

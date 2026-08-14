@@ -13,6 +13,8 @@ export interface PaginatedResponse<T> {
   page: number;
   page_size: number;
   total_pages: number;
+  // 各状态的全量条数，不受分页和筛选影响
+  status_counts?: Record<string, number>;
 }
 
 // Auth
@@ -76,11 +78,29 @@ export interface Order {
   buyer_id: string;
   quantity: number;
   amount: string;
+  buy_num?: number;
+  auction_price?: string;
+  confirm_fee?: string;
+  refund_fee?: string;
+  post_fee?: string;
   status: OrderStatus;
   order_status?: OrderStatus;
   receiver_name?: string;
   receiver_phone?: string;
   receiver_address?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+// 快捷短语：人工客服常用话术
+export interface QuickPhrase {
+  id: number;
+  category: string;
+  title: string;
+  content: string;
+  sort_order: number;
+  enabled: boolean;
+  use_count: number;
   created_at?: string;
   updated_at?: string;
 }
@@ -446,8 +466,24 @@ export interface OrderAnalytics {
   revenue_stats: {
     total_amount: number;
     total_orders: number;
+    avg_amount?: number;
+    unique_buyers?: number;
+    unique_items?: number;
+    // 确认收货后卖家实收，退款订单为 0
+    confirmed_amount?: number;
+    refunded_amount?: number;
+    total_items_sold?: number;
+    // 全部状态的口径，与订单页数字一致
+    all_orders?: number;
+    all_amount?: number;
   };
-  daily_stats: Array<{ date: string; amount: number }>;
+  daily_stats: Array<{
+    date: string;
+    amount: number;
+    order_count?: number;
+    confirmed_amount?: number;
+    refunded_amount?: number;
+  }>;
   item_stats?: Array<{
     item_id: string;
     order_count: number;
@@ -463,6 +499,25 @@ export interface SystemSettings {
   ai_base_url?: string;
   default_reply?: string;
   registration_enabled?: boolean;
+  // 注册是否必须填邮箱验证码。没配 SMTP 时关掉，否则注册会卡在收不到验证码
+  email_verification_enabled?: boolean;
+  // 定时从卖家端拉取订单，默认开启
+  order_sync_enabled?: boolean;
+  order_sync_interval?: number;
+  // 商品擦亮，默认关闭
+  auto_polish_enabled?: boolean;
+  auto_polish_interval?: number;
+  // 对买家产生实际动作，默认关闭
+  auto_rate_enabled?: boolean;
+  // 订单页评价框的预填文案，避免每单重复手打
+  auto_rate_template?: string;
+  auto_flower_enabled?: boolean;
+  // 公告与更新：地址存为字符串，开关也用字符串以复用通用设置接口
+  announcement_source_url?: string;
+  announcement_enabled?: string;
+  // 公告与版本提示分开控制展示，未设置时按展示处理
+  announcement_show_notice?: boolean;
+  announcement_show_update?: boolean;
   smtp_server?: string;
   [key: string]: any;
 }
@@ -489,4 +544,24 @@ export interface DefaultReply {
   reply_content: string;
   reply_once: boolean;
   reply_image_url?: string;
+}
+
+// 全局公告与版本检查
+export interface AnnouncementItem {
+  id: string;
+  title: string;
+  content: string;
+  level: 'info' | 'warning' | 'danger';
+  published_at: string;
+}
+
+export interface AnnouncementPayload {
+  local_version: string;
+  latest_version: string;
+  download_url: string;
+  release_notes: string;
+  has_update: boolean;
+  source_configured: boolean;
+  error: string;
+  announcements: AnnouncementItem[];
 }

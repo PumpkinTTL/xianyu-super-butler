@@ -10,9 +10,11 @@ import {
   MessageSquare,
   Settings,
   ShoppingBag,
+  Star,
   Users,
   Workflow,
   X,
+  Info,
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -37,6 +39,7 @@ const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, onLogout, mo
         { id: 'accounts', icon: Users, label: '账号管理' },
         { id: 'items', icon: Box, label: '商品与发货' },
         { id: 'orders', icon: ShoppingBag, label: '订单管理' },
+        { id: 'buyer-interaction', icon: Star, label: '买家互动' },
         { id: 'cards', icon: CreditCard, label: '卡密库存' },
       ],
     },
@@ -59,6 +62,7 @@ const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, onLogout, mo
       items: [
         { id: 'notifications', icon: BellRing, label: '通知与日志' },
         { id: 'settings', icon: Settings, label: '系统设置' },
+        { id: 'about', icon: Info, label: '关于' },
       ],
     },
   ];
