@@ -447,11 +447,12 @@ const AccountList: React.FC = () => {
               setQrMessage(statusRes.message || '二维码已失效，请重试');
               return;
             } else if (statusRes.status === 'verification_required') {
+              qrSessionRef.current = '';
               setQrStatus('verification_required');
               setQrMessage(statusRes.message || '请使用手机扫描二维码完成安全验证');
               setVerificationQrUrl(statusRes.verification_qr_code_url || '');
               setVerificationUrl(statusRes.verification_url || '');
-              // 不 return，继续轮询，等待验证完成后会话放行自动登录成功
+              return;
             }
 
             qrPollTimerRef.current = setTimeout(pollStatus, 800);
