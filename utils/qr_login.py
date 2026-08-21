@@ -63,7 +63,6 @@ class QRLoginSession:
         self.expire_time = 300  # 5分钟过期
         self.params = {}  # 存储登录参数
         self.verification_url = None  # 风控验证URL
-        self.face_qr_url = None  # 人脸验证二维码 (base64 data-url，后台链路抓取)
         self.verification_qr_code_url = None  # 验证URL的二维码，生成一次后复用
         self.verification_extended = False
         self.last_remote_status = None
@@ -95,7 +94,6 @@ class QRLoginManager:
 
     def __init__(self):
         self.sessions: Dict[str, QRLoginSession] = {}
-        self._face_tasks: set = set()  # 人脸验证后台任务强引用
         self.headers = generate_headers()
         self.host = "https://passport.goofish.com"
         self.api_mini_login = f"{self.host}/mini_login.htm"
@@ -367,26 +365,22 @@ class QRLoginManager:
 
                         if data.get("iframeRedirect") is True and not session.unb:
                             # 账号被风控，需要手机/人脸验证。
+                            #
+                            # 这里绝不能 break：用户在手机上完成人脸验证后，只有
+                            # 继续轮询 query.do 才会拿到带登录态的 CONFIRMED。
                             iframe_url = data.get("iframeRedirectUrl")
                             if session.status != 'verification_required':
                                 session.status = 'verification_required'
                                 session.verification_url = iframe_url
                                 # 人脸验证要用户掏手机、扫码、刷脸，延长会话有效期
                                 session.extend_for_verification()
-                                logger.warning(f"账号被风控，启动人脸验证链路: {session_id}, URL: {iframe_url}")
-                                # 双保险1：后台纯API人脸链路（自动抓人脸二维码+轮询check.do完成）
-                                from utils.qr_login_face_verification import run_face_verification
-                                task = asyncio.create_task(
-                                    run_face_verification(self, session_id, iframe_url)
+                                logger.warning(
+                                    f"账号被风控，需要手机验证: {session_id}, URL: {iframe_url}"
                                 )
-                                self._face_tasks.add(task)
-                                task.add_done_callback(self._face_tasks.discard)
                             elif iframe_url and iframe_url != session.verification_url:
                                 # 验证链路中途换 URL，跟上以免二维码失效
                                 session.verification_url = iframe_url
                                 session.verification_qr_code_url = None
-                            # 双保险2：继续轮询 query.do —— 用户手机完成验证后，
-                            # CONFIRMED 响应会自带登录态 cookie，走上面的收 Cookie 逻辑
                             await asyncio.sleep(1.5)
                             continue
 

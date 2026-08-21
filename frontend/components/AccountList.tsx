@@ -494,9 +494,8 @@ const AccountList: React.FC = () => {
               // 验证走完后状态才会变成 success。
               setQrStatus('verification_required');
               setQrMessage(statusRes.message || '请使用手机扫描二维码完成安全验证');
-              const nextQr = statusRes.face_qr_url || statusRes.verification_qr_code_url;
-              if (nextQr) {
-                setVerificationQrUrl(nextQr);
+              if (statusRes.verification_qr_code_url) {
+                setVerificationQrUrl(statusRes.verification_qr_code_url);
               }
               if (statusRes.verification_url) {
                 setVerificationUrl(statusRes.verification_url);
