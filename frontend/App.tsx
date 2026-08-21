@@ -2,6 +2,7 @@ import React, { Suspense, lazy, useState, useEffect } from 'react';
 import Sidebar from './components/Sidebar';
 import GlobalFeedback from './components/GlobalFeedback';
 import AnnouncementBanner from './components/AnnouncementBanner';
+import ThemeToggle from './components/ThemeToggle';
 import { login, verifyToken, getPublicSettings, register, sendVerificationCode } from './services/api';
 import { ShieldCheck, ArrowRight, Loader2, User, Lock, Menu, Mail, KeyRound, CheckCircle2 } from 'lucide-react';
 
@@ -199,9 +200,9 @@ const App: React.FC = () => {
 
   if (checkingAuth) {
       return (
-          <div className="min-h-screen flex items-center justify-center bg-[#f5f6f7]">
-              <div className="flex items-center gap-3 text-sm font-semibold text-gray-600">
-                <Loader2 className="h-5 w-5 animate-spin text-[#b29c00]" />
+          <div className="min-h-screen flex items-center justify-center bg-[var(--app-bg)]">
+              <div className="flex items-center gap-3 text-sm font-semibold text-[var(--text-muted)]">
+                <Loader2 className="h-5 w-5 animate-spin text-[var(--brand-text)]" />
                 正在验证登录状态
               </div>
           </div>
@@ -211,25 +212,34 @@ const App: React.FC = () => {
   // Login Screen Component
   if (!isLoggedIn) {
     return (
-      <div className="min-h-screen bg-[#f5f6f7] p-4 font-sans sm:p-6">
+      <div className="relative min-h-screen bg-[var(--app-bg)] p-4 font-sans text-[var(--text)] sm:p-6">
+        <ThemeToggle compact className="absolute right-4 top-4 z-10 sm:right-6 sm:top-6" />
         <div className="mx-auto flex min-h-[calc(100vh-2rem)] max-w-5xl items-center justify-center sm:min-h-[calc(100vh-3rem)]">
-          <div className="grid w-full overflow-hidden rounded-md border border-[#dfe2e5] bg-white shadow-sm lg:grid-cols-[1.05fr_0.95fr]">
-            <div className="hidden min-h-[560px] flex-col justify-between border-r border-[#dfe2e5] bg-[#f0f1f2] p-10 lg:flex">
+          <div className="grid w-full overflow-hidden rounded-3xl bg-[var(--surface)] lg:grid-cols-[1.05fr_0.95fr]"
+               style={{ border: '1px solid var(--border)', boxShadow: 'var(--shadow-lg)' }}>
+            {/* 品牌侧：黄色渐变作为整站第一印象 */}
+            <div
+              className="theme-brand-panel hidden min-h-[560px] flex-col justify-between p-10 lg:flex"
+              style={{ background: 'linear-gradient(155deg, #fff8d1 0%, #ffe566 55%, #ffe100 100%)' }}
+            >
               <div>
-                <div className="flex h-11 w-11 items-center justify-center rounded-md border border-[#e4cf00] bg-[#ffe100]">
-                  <span className="text-xl font-black text-[#1f2328]">闲</span>
+                <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-white/70 backdrop-blur">
+                  <span className="text-2xl font-black text-[#2a2416]">闲</span>
                 </div>
-                <p className="mt-6 text-xs font-bold text-[#8c7900]">Xianyu Super Butler</p>
-                <h1 className="mt-2 max-w-md text-2xl font-extrabold leading-tight text-[#1f2328]">
-                  闲鱼经营与自动化工作台
+                <p className="mt-7 text-xs font-bold tracking-widest text-[#8a6300]">XIANYU SUPER BUTLER</p>
+                <h1 className="mt-2 max-w-md text-3xl font-extrabold leading-tight text-[#2a2416]">
+                  闲鱼超级管家
                 </h1>
-                <p className="mt-4 max-w-md text-sm leading-7 text-[#5f666e]">
+                <p className="mt-4 max-w-md text-sm leading-7 text-[#6b5200]">
                   统一处理账号、商品、订单、消息、回复和自动发货。
                 </p>
               </div>
-              <div className="grid grid-cols-2 gap-px overflow-hidden rounded-md border border-[#d7dade] bg-[#d7dade]">
+              <div className="grid grid-cols-2 gap-3">
                 {['账号与商品同步', '订单与发货处理', '消息与自动回复', '通知与运行日志'].map(item => (
-                  <div key={item} className="bg-white px-4 py-3 text-xs font-bold text-[#4f565e]">
+                  <div
+                    key={item}
+                    className="rounded-2xl bg-white/70 px-4 py-3 text-xs font-bold text-[#544c39] backdrop-blur"
+                  >
                     {item}
                   </div>
                 ))}
@@ -239,8 +249,14 @@ const App: React.FC = () => {
             <div className="flex min-h-[500px] items-center p-7 sm:p-10">
               <div className="mx-auto w-full max-w-sm animate-fade-in">
                 <div className="mb-8">
-                  <div className="mb-5 flex h-12 w-12 items-center justify-center rounded-md border border-[#e4cf00] bg-[#ffe100] lg:hidden">
-                    <span className="text-xl font-black text-[#1f2328]">闲</span>
+                  <div
+                    className="mb-5 flex h-14 w-14 items-center justify-center rounded-2xl lg:hidden"
+                    style={{
+                      background: 'linear-gradient(140deg, var(--brand-300), var(--brand))',
+                      boxShadow: 'var(--shadow-brand)',
+                    }}
+                  >
+                    <span className="text-xl font-black text-[#2a2416]">闲</span>
                   </div>
                   <h2 className="text-2xl font-extrabold text-gray-900">
                     {authMode === 'login' ? '登录管理后台' : '注册新账号'}
@@ -411,7 +427,7 @@ const App: React.FC = () => {
                         <button
                           type="button"
                           onClick={() => { setAuthMode('register'); setLoginError(''); setLoginNotice(''); }}
-                          className="ml-1 font-bold text-[#8c7900] hover:underline"
+                          className="ml-1 font-bold text-[var(--brand-text)] hover:underline"
                         >
                           注册新账号
                         </button>
@@ -421,7 +437,7 @@ const App: React.FC = () => {
                         <button
                           type="button"
                           onClick={() => { setAuthMode('login'); setRegError(''); setRegNotice(''); }}
-                          className="ml-1 font-bold text-[#8c7900] hover:underline"
+                          className="ml-1 font-bold text-[var(--brand-text)] hover:underline"
                         >
                           返回登录
                         </button>
@@ -431,7 +447,7 @@ const App: React.FC = () => {
                 )}
 
                 <p className="mt-7 border-t border-gray-100 pt-5 text-xs font-medium text-gray-400">
-                  闲鱼智控 · Management Console
+                  闲鱼超级管家 · Management Console
                 </p>
               </div>
             </div>
@@ -442,7 +458,7 @@ const App: React.FC = () => {
   }
 
   return (
-    <div className="flex min-h-screen bg-[#f5f6f7] text-[#1f2328]">
+    <div className="flex min-h-screen bg-[var(--app-bg)] text-[var(--text)]">
       <GlobalFeedback />
       <Sidebar 
         activeTab={activeTab} 
@@ -460,7 +476,7 @@ const App: React.FC = () => {
       />
       
       <main className="min-h-screen min-w-0 flex-1 overflow-y-auto lg:ml-[248px]">
-        <header className="sticky top-0 z-20 flex h-14 items-center gap-3 border-b border-[#e4e6e8] bg-white px-4 lg:hidden">
+        <header className="sticky top-0 z-20 flex h-14 items-center gap-3 border-b border-[var(--border)] bg-[var(--surface)] px-4 lg:hidden">
           <button
             type="button"
             onClick={() => setMobileMenuOpen(true)}
@@ -471,9 +487,10 @@ const App: React.FC = () => {
             <Menu className="w-5 h-5" />
           </button>
           <div className="min-w-0">
-            <p className="truncate text-sm font-bold">{pageLabels[activeTab] || '闲鱼智控'}</p>
-            <p className="text-[11px] text-gray-400">闲鱼智控</p>
+            <p className="truncate text-sm font-bold">{pageLabels[activeTab] || '闲鱼超级管家'}</p>
+            <p className="text-[11px] text-gray-400">闲鱼超级管家</p>
           </div>
+          <ThemeToggle compact className="ml-auto" />
         </header>
         {activeTab !== 'messages' && <AnnouncementBanner />}
         <div className={

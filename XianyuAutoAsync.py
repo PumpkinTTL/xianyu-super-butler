@@ -11,7 +11,7 @@ from utils import browser_limit
 import websockets
 from utils.xianyu_utils import (
     decrypt, generate_mid, generate_uuid, trans_cookies,
-    generate_device_id, generate_sign
+    generate_device_id, generate_sign, CAPTCHA_CHALLENGE_COOKIES
 )
 from app.config import (
     WEBSOCKET_URL, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
@@ -40,14 +40,33 @@ class ConnectionState(Enum):
     CLOSED = "closed"  # 已关闭
 
 
+class ItemListTransientError(Exception):
+    """商品列表接口的临时故障（网关 5xx、响应不是 JSON 等）。
+
+    与业务错误区分开：这类故障重试就可能好，不该被写成“未返回在售分组”
+    之类的数据结论，否则用户会以为是账号或商品的问题。
+    """
+
+
 class AutoReplyPauseManager:
-    """自动回复暂停管理器"""
+    """自动回复暂停管理器（人工接入后暂停该会话的自动回复）。
+
+    键必须是 (cookie_id, chat_id) 而不是单独的 chat_id。这是个全局单例，
+    所有账号共用；chat_id 标识的是一个会话，当用户自己的两个账号正好是同一个
+    会话的两端时（测试自动回复时最常见的做法），两边拿到的是同一个 chat_id。
+    于是 A 账号手动发一条消息，就会把 B 账号对这个会话的自动回复一起停掉，
+    表现为「关键词明明配好了却不回」，而唯一线索只有一行 info 日志。
+    """
     def __init__(self):
-        # 存储每个chat_id的暂停信息 {chat_id: pause_until_timestamp}
+        # {(cookie_id, chat_id): pause_until_timestamp}
         self.paused_chats = {}
 
+    @staticmethod
+    def _key(cookie_id: str, chat_id: str):
+        return (str(cookie_id), str(chat_id))
+
     def pause_chat(self, chat_id: str, cookie_id: str):
-        """暂停指定chat_id的自动回复，使用账号特定的暂停时间"""
+        """暂停指定账号下该 chat_id 的自动回复，使用账号特定的暂停时间"""
         # 获取账号特定的暂停时间
         try:
             from app.db_manager import db_manager
@@ -63,46 +82,42 @@ class AutoReplyPauseManager:
 
         pause_duration_seconds = pause_minutes * 60
         pause_until = time.time() + pause_duration_seconds
-        self.paused_chats[chat_id] = pause_until
+        self.paused_chats[self._key(cookie_id, chat_id)] = pause_until
 
         # 计算暂停结束时间
         end_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(pause_until))
         logger.info(f"【{cookie_id}】检测到手动发出消息，chat_id {chat_id} 自动回复暂停{pause_minutes}分钟，恢复时间: {end_time}")
 
-    def is_chat_paused(self, chat_id: str) -> bool:
-        """检查指定chat_id是否处于暂停状态"""
-        if chat_id not in self.paused_chats:
+    def is_chat_paused(self, chat_id: str, cookie_id: str) -> bool:
+        """检查指定账号下该 chat_id 是否处于暂停状态"""
+        key = self._key(cookie_id, chat_id)
+        pause_until = self.paused_chats.get(key)
+        if pause_until is None:
             return False
 
-        current_time = time.time()
-        pause_until = self.paused_chats[chat_id]
-
-        if current_time >= pause_until:
+        if time.time() >= pause_until:
             # 暂停时间已过，移除记录
-            del self.paused_chats[chat_id]
+            del self.paused_chats[key]
             return False
 
         return True
 
-    def get_remaining_pause_time(self, chat_id: str) -> int:
-        """获取指定chat_id剩余暂停时间（秒）"""
-        if chat_id not in self.paused_chats:
+    def get_remaining_pause_time(self, chat_id: str, cookie_id: str) -> int:
+        """获取指定账号下该 chat_id 的剩余暂停时间（秒）"""
+        pause_until = self.paused_chats.get(self._key(cookie_id, chat_id))
+        if pause_until is None:
             return 0
 
-        current_time = time.time()
-        pause_until = self.paused_chats[chat_id]
-        remaining = max(0, int(pause_until - current_time))
-
-        return remaining
+        return max(0, int(pause_until - time.time()))
 
     def cleanup_expired_pauses(self):
         """清理已过期的暂停记录"""
         current_time = time.time()
-        expired_chats = [chat_id for chat_id, pause_until in self.paused_chats.items()
-                        if current_time >= pause_until]
+        expired = [key for key, pause_until in self.paused_chats.items()
+                   if current_time >= pause_until]
 
-        for chat_id in expired_chats:
-            del self.paused_chats[chat_id]
+        for key in expired:
+            del self.paused_chats[key]
 
 
 # 全局暂停管理器实例
@@ -814,6 +829,10 @@ class XianyuLive:
         self.buyer_interaction_task = None
         self._auto_rated_orders = set()
         self._auto_flowered_orders = set()
+        # 已发过确认收货致谢的会话/订单，避免同一笔交易的多条系统消息各发一次
+        self._thanked_receipts = set()
+        # 买家互动即时触发的去重标记
+        self._buyer_interaction_triggering = False
 
         # 扫码登录Cookie刷新标志
         self.last_qr_cookie_refresh_time = 0  # 记录上次扫码登录Cookie刷新时间
@@ -838,6 +857,10 @@ class XianyuLive:
         self.max_connection_failures = 5  # 最大连续失败次数
         self.last_successful_connection = 0  # 上次成功连接时间
         self.last_state_change_time = time.time()  # 上次状态变化时间
+        # 登录态已过期且无法自动续期时置位。与"风控中"要分开：风控能等能过验证，
+        # 会话过期只能重新扫码，界面必须给出不同的指引。
+        self.needs_relogin = False
+        self.relogin_reason = ''
 
         # 后台任务追踪（用于清理未等待的任务）
         self.background_tasks = set()  # 追踪所有后台任务
@@ -1447,6 +1470,15 @@ class XianyuLive:
                 except Exception as parse_e:
                     logger.warning(f"解析dynamicOperation JSON失败: {parse_e}")
 
+            # 方法2.5: 从 message['3'] 中直接提取 orderId
+            if not order_id:
+                message_3 = message.get('3')
+                if isinstance(message_3, dict):
+                    direct_order_id = message_3.get('orderId')
+                    if direct_order_id and str(direct_order_id).isdigit():
+                        order_id = str(direct_order_id)
+                        logger.info(f'【{self.cookie_id}】✅ 从message[3].orderId提取到订单ID: {order_id}')
+
             # 方法3: 如果前面的方法都失败，尝试在整个消息中搜索订单ID模式
             if not order_id:
                 try:
@@ -1455,10 +1487,10 @@ class XianyuLive:
 
                     # 搜索各种可能的订单ID模式
                     patterns = [
-                        r'orderId[=:](\d{10,})',  # orderId=123456789 或 orderId:123456789
+                        r'orderId["\']?\s*[:=]\s*["\']?(\d{10,})',  # orderId: '123' 或 orderId=123
                         r'order_detail\?id=(\d{10,})',  # order_detail?id=123456789
                         r'"id"\s*:\s*"?(\d{10,})"?',  # "id":"123456789" 或 "id":123456789
-                        r'bizOrderId[=:](\d{10,})',  # bizOrderId=123456789
+                        r'bizOrderId["\']?\s*[:=]\s*["\']?(\d{10,})',  # bizOrderId=123456789
                     ]
 
                     for pattern in patterns:
@@ -2032,6 +2064,9 @@ class XianyuLive:
         """
         # 初始化通知发送标志，避免重复发送通知
         notification_sent = False
+        # 本轮是否已经记过一次风控熔断。滑块失败分支和后面基于 ret 的通用分支
+        # 都会 trip()，同一次失败记两次会让冷却阶梯跳级、账号被多锁一倍时间。
+        already_tripped = False
         
         try:
             logger.info(f"【{self.cookie_id}】开始刷新token... (滑块验证重试次数: {captcha_retry_count})")
@@ -2079,7 +2114,13 @@ class XianyuLive:
             # await self._execute_cookie_refresh(time.time())
             try:
                 from app.db_manager import db_manager
-                account_info = db_manager.get_cookie_details(self.cookie_id)
+                # 必须走线程池。db_manager 是同步 SQLite 且带全局锁，直接在事件
+                # 循环里调用会把整个循环卡住 —— 此时 HTTP 线程通过
+                # run_coroutine_threadsafe 提交的删除、更新等操作永远得不到调度，
+                # 表现为「点删除账号没反应，最后报超时」。
+                account_info = await asyncio.to_thread(
+                    db_manager.get_cookie_details, self.cookie_id
+                )
                 if account_info and account_info.get('cookie_value'):
                     new_cookies_str = account_info.get('cookie_value')
                     if new_cookies_str != self.cookies_str:
@@ -2172,10 +2213,14 @@ class XianyuLive:
                     response_keys = sorted(res_json.keys()) if isinstance(res_json, dict) else []
                     response_data = res_json.get("data") if isinstance(res_json, dict) else None
                     data_keys = sorted(response_data.keys()) if isinstance(response_data, dict) else []
+                    # ret 是闲鱼说明失败原因的唯一字段（TOKEN 过期、未登录、风控拦截
+                    # 各有不同取值）。原先只记结构不记 ret，日志里只能看到
+                    # 「data_keys=[] / Token获取失败」，等于把唯一的线索丢了。
+                    response_ret = res_json.get("ret") if isinstance(res_json, dict) else None
                     logger.info(
                         f"【{self.cookie_id}】Token刷新响应结构: "
                         f"type={type(res_json).__name__}, keys={response_keys}, "
-                        f"data_keys={data_keys}, "
+                        f"data_keys={data_keys}, ret={response_ret}, "
                         f"has_access_token={isinstance(response_data, dict) and bool(response_data.get('accessToken'))}"
                     )
                     logger.info(f"【{self.cookie_id}】================================")
@@ -2213,6 +2258,17 @@ class XianyuLive:
                                 logger.info(f"【{self.cookie_id}】Token刷新成功")
                                 # 标记为成功
                                 self.last_token_refresh_status = "success"
+                                # 拿到有效 token 就说明登录态是活的，必须清掉
+                                # 「需重新扫码」终态标记。它曾经只置不清，于是账号
+                                # 明明已经连上、订单和消息都在同步，界面还一直挂着
+                                # 「需重新扫码」，把用户引去做一次没必要的扫码。
+                                if self.needs_relogin:
+                                    logger.info(
+                                        f"【{self.cookie_id}】登录态已恢复，"
+                                        f"清除「需重新扫码」标记"
+                                    )
+                                self.needs_relogin = False
+                                self.relogin_reason = ''
                                 risk_control.registry.get(self.cookie_id).reset()
                                 return new_token
 
@@ -2278,6 +2334,10 @@ class XianyuLive:
                                 risk_control.registry.get(self.cookie_id).trip(
                                     "滑块自动验证失败，需人工处理"
                                 )
+                                # 本轮已经熔断过，后面基于 ret 的通用风控分支不要再记一次：
+                                # 同一次失败连续 trip 两次会让冷却阶梯跳级
+                                # （300 秒直接跳到 600 秒），账号被多锁一倍时间。
+                                already_tripped = True
 
                                 # 更新风控日志为失败状态
                                 if 'log_id' in locals() and log_id:
@@ -2330,19 +2390,54 @@ class XianyuLive:
                             # 标记已发送通知（通知已在_handle_captcha_verification中发送）
                             notification_sent = True
 
-                    # 检查是否包含"令牌过期"或"Session过期"
+                    # 「令牌过期」和「Session过期」必须分开处理 —— 它们不是一回事：
+                    #
+                    #   FAIL_SYS_TOKEN_EXOIRED::令牌过期
+                    #       mtop 的签名令牌 _m_h5_tk 过时了。失败响应本身就会
+                    #       set-cookie 下发新令牌，重签一次即可，属可恢复。
+                    #   FAIL_SYS_SESSION_EXPIRED::Session过期
+                    #       登录会话（cookie2 / unb）真的死了，滑块和等待都救不回来，
+                    #       只能重新扫码。
+                    #
+                    # 原来一个 if 把两者一起打上「需重新扫码」终态，于是仅仅令牌
+                    # 过期也会让界面提示重扫；而实测紧接着的下一次刷新就返回
+                    # SUCCESS，账号完全正常。
                     if isinstance(res_json, dict):
                         res_json_str = json.dumps(res_json, ensure_ascii=False, separators=(',', ':'))
-                        if '令牌过期' in res_json_str or 'Session过期' in res_json_str:
+                        session_expired = 'Session过期' in res_json_str
+                        token_expired = '令牌过期' in res_json_str
+
+                        if token_expired and not session_expired:
+                            # 令牌已随本次响应更新，直接带新令牌重试。必须递增计数：
+                            # 递归上限由 refresh_token 开头的
+                            # max_captcha_verification_count 统一把关。
+                            logger.warning(
+                                f"【{self.cookie_id}】签名令牌过期（可恢复），"
+                                f"带新令牌重试第 {captcha_retry_count + 1} 次"
+                            )
+                            return await self.refresh_token(captcha_retry_count + 1)
+
+                        if session_expired:
                             # 调用统一的密码登录刷新方法
-                            refresh_success = await self._try_password_login_refresh("令牌/Session过期")
-                            
+                            refresh_success = await self._try_password_login_refresh("Session过期")
+
                             if not refresh_success:
+                                # 会话过期和风控是两回事：滑块过了也救不回来，只能重新登录。
+                                # 打上终态标记，让界面能明确提示"请重新扫码"，
+                                # 否则用户只看到「连接中/重连」，会一直等一个不会好的状态。
+                                self.needs_relogin = True
+                                self.relogin_reason = '闲鱼登录态已过期，请重新扫码登录'
+                                logger.error(
+                                    f"【{self.cookie_id}】登录态已过期且无法自动续期"
+                                    f"（未配置账号密码或密码登录失败），需要重新扫码登录"
+                                )
                                 # 标记已发送通知，避免重复通知
                                 notification_sent = True
                                 # 返回None，让调用者知道刷新失败
                                 return None
                             else:
+                                self.needs_relogin = False
+                                self.relogin_reason = ''
                                 # 刷新成功后重新获取 token。必须递增计数，否则上限判断
                                 # 永远不成立，会形成无限递归重试并持续加剧平台风控。
                                 return await self.refresh_token(captcha_retry_count + 1)
@@ -2355,7 +2450,8 @@ class XianyuLive:
 
                     # 平台风控：立刻熔断，避免重试风暴反复触发验证
                     if risk_control.is_risk_control_error(json.dumps(ret_value, ensure_ascii=False)):
-                        guard.trip(str(ret_value[:2]))
+                        if not already_tripped:
+                            guard.trip(str(ret_value[:2]))
                         self.last_token_refresh_status = "risk_control"
                         return None
 
@@ -2518,6 +2614,19 @@ class XianyuLive:
                     )
 
                 if success and cookies:
+                    # 边界防御：只有 x5sec 才是通行凭证。x5secdata / x5sectag 是挑战
+                    # 标记，必然存在，不能拿它们当验证通过的证据 —— 否则会把一堆
+                    # 挑战 cookie 写回账号，token 刷新永远 FAIL_SYS_USER_VALIDATE。
+                    if 'x5sec' not in {k.lower() for k in cookies}:
+                        logger.error(
+                            f"【{self.cookie_id}】滑块返回的 cookie 中没有 x5sec，"
+                            f"视觉通过但服务端未放行，按失败处理。"
+                            f"已有key: {list(cookies.keys())}"
+                        )
+                        success = False
+                        cookies = None
+
+                if success and cookies:
                     logger.info(f"【{self.cookie_id}】滑块验证成功，获取到新的cookies")
 
                     # 只提取x5sec相关的cookie值进行更新
@@ -2547,6 +2656,21 @@ class XianyuLive:
                             logger.warning(f"【{self.cookie_id}】新增x5 cookie: {cookie_name}")
                             updated_cookies[cookie_name] = cookie_value
                             new_cookie_count += 1
+
+                    # 拿到 x5sec 就必须清掉挑战标记。x5secdata / x5sectag 表示"这个请求
+                    # 还有一道未完成的人机验证"，而 x5sec 才是通过凭证。
+                    # 原来只做新增和覆盖、从不删除，于是滑块过了以后 Cookie 里
+                    # x5sec 和旧的 x5secdata 同时存在 —— 闲鱼据此认为挑战仍未完成，
+                    # 继续返回 FAIL_SYS_USER_VALIDATE，表现为"滑块过了却一直用不了"。
+                    if 'x5sec' in {k.lower() for k in x5sec_cookies}:
+                        for stale in CAPTCHA_CHALLENGE_COOKIES:
+                            for name in [k for k in updated_cookies if k.lower() == stale]:
+                                # 本次滑块响应又下发了同名值时以新值为准，不要删
+                                if name not in x5sec_cookies:
+                                    updated_cookies.pop(name, None)
+                                    logger.warning(
+                                        f"【{self.cookie_id}】已清除过期的验证挑战标记: {name}"
+                                    )
 
                     # 将合并后的cookies字典转换为字符串格式
                     cookies_str = "; ".join([f"{k}={v}" for k, v in updated_cookies.items()])
@@ -7404,14 +7528,20 @@ class XianyuLive:
                         break
 
                     from app.db_manager import db_manager
-                    rate_on = str(db_manager.get_system_setting('auto_rate_enabled') or '').strip().lower() in ('1', 'true', 'yes')
-                    flower_on = str(db_manager.get_system_setting('auto_flower_enabled') or '').strip().lower() in ('1', 'true', 'yes')
+                    # 开关按账号存：不同账号经营策略不同，全局开关意味着一开就是
+                    # 所有账号一起开，用户没法只对部分账号启用。
+                    interaction = db_manager.get_buyer_interaction_settings(self.cookie_id)
+                    rate_on = interaction['auto_rate_enabled']
+                    flower_on = interaction['auto_flower_enabled']
                     interval_str = db_manager.get_system_setting('buyer_interaction_interval')
                     try:
                         interval = int(interval_str) if interval_str else 7200
                     except (TypeError, ValueError):
                         interval = 7200
-                    interval = max(1800, interval)
+                    # 下限从 30 分钟放宽到 5 分钟：确认收货现在由消息事件即时触发，
+                    # 轮询退化成兜底（漏收消息、服务重启期间完成的订单）。但仍要有
+                    # 下限 —— 这条循环每轮都拉一次卖出订单列表，太频繁会招来风控。
+                    interval = min(max(300, interval), 86400)
 
                     if (not rate_on and not flower_on) or not self.cookies_str:
                         await self._interruptible_sleep(180)
@@ -7453,6 +7583,111 @@ class XianyuLive:
             raise
         finally:
             logger.info(f"【{self.cookie_id}】买家互动任务已退出")
+
+    # 确认收货致谢的默认文案。留空则不发。
+    DEFAULT_THANKS_TEMPLATE = '亲，感谢支持！有任何问题随时找我~'
+
+    async def send_post_receipt_thanks(self, websocket, chat_id, to_user_id, order_id=None):
+        """确认收货后给买家发一条致谢文本。
+
+        和评价/求花不同，这条只是发消息，不依赖卖出订单接口的状态流转，所以直接
+        在收到「交易成功」消息时就地发出 —— 此时 chat_id 和买家 ID 都在手上，
+        不必再查订单。
+
+        同一个会话只发一次：确认收货往往伴随多条系统消息（交易成功、评价提醒、
+        小红花提醒），逐条发会连着骚扰买家。
+        """
+        from app.db_manager import db_manager
+
+        if not db_manager.get_buyer_interaction_settings(
+            self.cookie_id
+        )['auto_thanks_enabled']:
+            return False
+
+        key = str(order_id or chat_id)
+        if key in self._thanked_receipts:
+            logger.debug(f"【{self.cookie_id}】{key} 已发过确认收货致谢，跳过")
+            return False
+
+        template = (
+            db_manager.get_system_setting('auto_thanks_template')
+            or self.DEFAULT_THANKS_TEMPLATE
+        ).strip()
+        if not template:
+            return False
+
+        # 先登记再发送：发送失败也不重试，避免异常时反复打扰买家
+        self._thanked_receipts.add(key)
+        try:
+            await self.send_msg(websocket, chat_id, to_user_id, template)
+            logger.info(f"【{self.cookie_id}】确认收货致谢已发送: chat_id={chat_id}")
+            return True
+        except Exception as exc:
+            logger.warning(
+                f"【{self.cookie_id}】确认收货致谢发送失败: {self._safe_str(exc)}"
+            )
+            return False
+
+    # 交易成功后触发前的等待秒数。闲鱼推送「交易成功」消息时，卖出订单接口未必
+    # 已经把该单切到 TRADE_SUCCESS，立刻去查会查不到；等一小会儿再查。
+    BUYER_INTERACTION_TRIGGER_DELAY = float(
+        os.getenv('BUYER_INTERACTION_TRIGGER_DELAY', '20')
+    )
+
+    async def trigger_buyer_interactions_now(self, reason: str = '交易成功'):
+        """收到交易成功消息后立即执行一次买家互动，不必等下一轮轮询。
+
+        轮询间隔最短也有几十分钟，买家确认收货后要等很久才评价/求花，时机上
+        已经偏晚。这里由消息事件驱动，做成「尽快执行一次」。
+
+        同一时刻只允许一个触发在跑：确认收货往往伴随多条系统消息（交易成功、
+        评价提醒、小红花提醒），每条都触发一次会连着打同一个接口。
+        """
+        if getattr(self, '_buyer_interaction_triggering', False):
+            logger.debug(f"【{self.cookie_id}】买家互动已在触发中，忽略重复的「{reason}」")
+            return
+
+        from app.db_manager import db_manager
+        interaction = db_manager.get_buyer_interaction_settings(self.cookie_id)
+        if not interaction['auto_rate_enabled'] and not interaction['auto_flower_enabled']:
+            return
+        if not self.cookies_str:
+            return
+
+        self._buyer_interaction_triggering = True
+
+        async def run():
+            try:
+                await asyncio.sleep(self.BUYER_INTERACTION_TRIGGER_DELAY)
+
+                from utils import risk_control
+                guard = risk_control.registry.get(self.cookie_id)
+                if guard.is_blocked:
+                    logger.info(
+                        f"【{self.cookie_id}】{reason}触发买家互动，但正处风控冷却，"
+                        f"交由定时轮询稍后处理"
+                    )
+                    return
+
+                logger.info(f"【{self.cookie_id}】{reason}，立即执行买家互动")
+                result = await self._run_buyer_interactions(
+                    interaction['auto_rate_enabled'], interaction['auto_flower_enabled']
+                )
+                if not result.get('rated') and not result.get('flowered'):
+                    logger.info(
+                        f"【{self.cookie_id}】{reason}触发未产生动作"
+                        f"（可能该单已评价过，或接口尚未返回可求花状态）"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    f"【{self.cookie_id}】{reason}触发买家互动失败: {self._safe_str(exc)}"
+                )
+            finally:
+                self._buyer_interaction_triggering = False
+
+        asyncio.create_task(run())
 
     async def _run_buyer_interactions(self, rate_on: bool, flower_on: bool) -> dict:
         """对已完结订单执行评价和求花。
@@ -9290,8 +9525,8 @@ class XianyuLive:
                 return
 
             # 检查该chat_id是否处于暂停状态
-            if pause_manager.is_chat_paused(chat_id):
-                remaining_time = pause_manager.get_remaining_pause_time(chat_id)
+            if pause_manager.is_chat_paused(chat_id, self.cookie_id):
+                remaining_time = pause_manager.get_remaining_pause_time(chat_id, self.cookie_id)
                 remaining_minutes = remaining_time // 60
                 remaining_seconds = remaining_time % 60
                 self._add_reply_decision_log(
@@ -9951,16 +10186,24 @@ class XianyuLive:
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】系统通知消息不处理')
                 return
             elif send_message == '[买家确认收货，交易成功]':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】交易完成消息不处理')
+                logger.info(f'[{msg_time}] 【{self.cookie_id}】交易完成，触发买家互动')
+                await self.send_post_receipt_thanks(websocket, chat_id, send_user_id)
+                await self.trigger_buyer_interactions_now('买家确认收货')
                 return
             elif send_message == '快给ta一个评价吧~' or send_message == '快给ta一个评价吧～':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】评价提醒消息不处理')
+                # 闲鱼只在交易完成后才推这条提醒，是个可靠的补充信号：
+                # 万一「交易成功」那条消息漏收，靠它也能触发。触发本身有去重。
+                logger.info(f'[{msg_time}] 【{self.cookie_id}】收到评价提醒，触发买家互动')
+                await self.send_post_receipt_thanks(websocket, chat_id, send_user_id)
+                await self.trigger_buyer_interactions_now('评价提醒')
                 return
             elif send_message == '卖家人不错？送Ta闲鱼小红花':
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】小红花提醒消息不处理')
                 return
             elif send_message == '[你已确认收货，交易成功]':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】买家确认收货消息不处理')
+                logger.info(f'[{msg_time}] 【{self.cookie_id}】确认收货，触发买家互动')
+                await self.send_post_receipt_thanks(websocket, chat_id, send_user_id)
+                await self.trigger_buyer_interactions_now('确认收货')
                 return
             elif send_message == '[你已发货]':
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】发货确认消息不处理')
@@ -10673,6 +10916,37 @@ class XianyuLive:
         if not self.session:
             await self.create_session()
 
+        def empty_result(group_name='在售', confirmed=False, response_fields=None):
+            """一件商品都没有，但这次同步是成功的。
+
+            这里必须带上 success 和调用方要读的全部字段。只有正常路径设了
+            `'success': True`，早期返回如果只给 {'items': []}，get_all_items 会按
+            `not result.get('success')` 判成失败并抛 502 —— 表现为新加的空账号
+            同步时只弹一句「Request failed with status code 502」。
+
+            confirmed 表示「确认这个账号真的没有商品」。它会让上层把库里已有商品
+            全标成已下架，所以只有在闲鱼明确回了分组、且分组商品数都是 0 时才置
+            True；分组列表整个为空这种可疑情况一律留 False。
+            """
+            return {
+                'success': True,
+                'page_number': page_number,
+                'page_size': page_size,
+                'current_count': 0,
+                'total_count': 0,
+                'api_total_count': 0,
+                'group_declared_count': 0,
+                'count_reconciled': False,
+                'items': [],
+                'saved_count': 0,
+                'next_page': False,
+                'confirmed_empty': confirmed,
+                'group_name': group_name,
+                'group_id': None,
+                'account_id': self.myid,
+                'response_fields': response_fields or [],
+            }
+
         async def request_item_api(data):
             params = {
                 'jsv': '2.7.2',
@@ -10701,7 +10975,24 @@ class XianyuLive:
                 params=params,
                 data={'data': data_val}
             ) as response:
-                res_json = await response.json()
+                # 网关故障要当场认出来。502/503 返回的是 HTML 错误页，
+                # 直接 response.json() 要么抛解析异常、要么拿到不含 ret 的结构，
+                # 最后被当成业务问题报成“未返回在售分组”，把临时抖动说成数据异常。
+                if response.status >= 500:
+                    raise ItemListTransientError(
+                        f"闲鱼接口返回 HTTP {response.status}"
+                    )
+                try:
+                    res_json = await response.json(content_type=None)
+                except Exception as parse_error:
+                    body = (await response.text())[:200]
+                    raise ItemListTransientError(
+                        f"闲鱼接口响应无法解析（HTTP {response.status}）: {parse_error}；响应片段: {body}"
+                    )
+                if not isinstance(res_json, dict):
+                    raise ItemListTransientError(
+                        f"闲鱼接口响应结构异常（HTTP {response.status}）"
+                    )
                 if 'set-cookie' in response.headers:
                     new_cookies = {}
                     for cookie in response.headers.getall('set-cookie', []):
@@ -10736,7 +11027,10 @@ class XianyuLive:
                         return await self.get_item_list_info(page_number, page_size, retry_count + 1)
                     return {'error': f"商品分组发现失败: {error_msg}"}
 
-                groups = discovery_response.get('data', {}).get('itemGroupList', [])
+                # 用 `or []` 兜住显式 None：闲鱼对无分组账号有时省略这个键
+                # （get 拿到默认的 []），有时又明确回 null（get 拿到 None）。
+                # 后者会让下面的遍历直接抛 TypeError，被外层吞成一句同步失败。
+                groups = discovery_response.get('data', {}).get('itemGroupList') or []
                 group_summary = [
                     {
                         'name': group.get('groupName'),
@@ -10752,10 +11046,80 @@ class XianyuLive:
                 )
                 item_group = self._select_item_group(groups)
                 if not item_group:
-                    return {
-                        'error': '闲鱼接口未返回“在售”分组，无法确认商品列表',
-                        'response_fields': sorted(discovery_response.get('data', {}).keys())
-                    }
+                    # 没匹配到“在售”不代表拿不到商品：闲鱼可能改了分组文案，
+                    # 账号也可能只有自定义分组。这里退回“按商品数最多的分组”，
+                    # 真的一件商品都没有才如实返回空列表，而不是报成接口异常。
+                    fallback_group = None
+                    for group in groups:
+                        if not isinstance(group, dict):
+                            continue
+                        if int(group.get('itemNumber') or 0) <= 0:
+                            continue
+                        if fallback_group is None or int(group.get('itemNumber') or 0) > int(
+                            fallback_group.get('itemNumber') or 0
+                        ):
+                            fallback_group = group
+
+                    if fallback_group:
+                        logger.warning(
+                            f"【{self.cookie_id}】未找到“在售”分组，改用"
+                            f"“{fallback_group.get('groupName')}”"
+                            f"（{fallback_group.get('itemNumber')} 件）继续同步"
+                        )
+                        item_group = fallback_group
+                    elif groups:
+                        logger.info(
+                            f"【{self.cookie_id}】账号所有分组均为 0 件商品，按空列表处理"
+                        )
+                        return empty_result(confirmed=True)
+                    else:
+                        # 分组列表为空，但发现请求本身返回了 SUCCESS —— 登录态是好的。
+                        # 关键在于：这次请求的响应里往往已经带着商品（cardList），
+                        # 只是没有分组信息。实测某账号 itemGroupList=None、
+                        # totalCount=0，而 cardList 里就有它的 4 件商品。
+                        #
+                        # 原先这里直接报错，接口以 502 返回，用户只看到一句
+                        # 「Request failed with status code 502」，而商品明明已经
+                        # 在手里。所以先尝试直接解析这次响应，解析不到才按空处理。
+                        discovery_data = discovery_response.get('data', {}) or {}
+                        discovered_items = self._extract_items_from_response(discovery_data)
+                        if discovered_items:
+                            logger.warning(
+                                f"【{self.cookie_id}】账号无商品分组，改用分组发现响应里的"
+                                f"商品列表：解析到 {len(discovered_items)} 件"
+                            )
+                            saved = await self.save_items_list_to_db(discovered_items)
+                            return {
+                                'success': True,
+                                'page_number': page_number,
+                                'page_size': page_size,
+                                'current_count': len(discovered_items),
+                                'total_count': len(discovered_items),
+                                'api_total_count': int(discovery_data.get('totalCount') or 0),
+                                'group_declared_count': 0,
+                                'count_reconciled': int(discovery_data.get('totalCount') or 0)
+                                != len(discovered_items),
+                                'items': discovered_items,
+                                'saved_count': saved,
+                                'next_page': bool(discovery_data.get('nextPage')),
+                                'confirmed_empty': False,
+                                'group_name': '全部',
+                                'group_id': None,
+                                'account_id': self.myid,
+                                'response_fields': sorted(discovery_data.keys()),
+                            }
+
+                        # 连商品也解析不到：可能真的没上架，也可能是接口抖动。
+                        # 按空列表处理但不置 confirmed_empty —— 后者会让上层把库里
+                        # 已有商品全标成已下架，不能凭一次可疑的空响应就清空状态。
+                        logger.info(
+                            f"【{self.cookie_id}】闲鱼未返回商品分组，响应里也没有商品，"
+                            f"按空列表处理（字段: {sorted(discovery_data.keys())}）"
+                        )
+                        return empty_result(
+                            confirmed=False,
+                            response_fields=sorted(discovery_data.keys()),
+                        )
                 self._item_list_group = item_group
 
             group_id = item_group.get('groupId')
@@ -10830,6 +11194,19 @@ class XianyuLive:
                 'account_id': self.myid,
                 'response_fields': response_fields
             }
+        except ItemListTransientError as e:
+            # 网关抖动：退避重试，比固定 0.5 秒更有机会等到恢复。
+            # 重试用尽后如实说明是接口临时故障，不要让用户去查账号和商品。
+            if retry_count + 1 >= 4:
+                logger.error(f"【{self.cookie_id}】商品列表接口持续异常: {self._safe_str(e)}")
+                return {'error': f"闲鱼接口暂时不可用（{self._safe_str(e)}），请稍后重试"}
+            backoff = min(2 ** retry_count, 8)
+            logger.warning(
+                f"【{self.cookie_id}】商品列表接口异常，{backoff}秒后重试"
+                f"（第{retry_count + 1}次）: {self._safe_str(e)}"
+            )
+            await asyncio.sleep(backoff)
+            return await self.get_item_list_info(page_number, page_size, retry_count + 1)
         except Exception as e:
             logger.error(f"商品信息API请求异常: {self._safe_str(e)}")
             await asyncio.sleep(0.5)
@@ -10888,6 +11265,29 @@ class XianyuLive:
             f"group={group_name}, total={len(all_items)}, saved={total_saved}, "
             f"confirmed_empty={confirmed_empty}"
         )
+
+        # 校准上下架状态。同步原先只做 upsert，接口不再返回的商品会永久留在
+        # 列表里，和在售的长得一样 —— 用户既分不清也筛不掉。
+        #
+        # 只在「完整且成功」的同步后才校准，否则会把在售商品误标成下架：
+        #   - 被 max_pages 截断时，后面几页的商品根本没被拉取；
+        #   - 一件都没返回时，除非接口明确确认为空，否则更可能是接口抖动。
+        off_shelf_count = 0
+        truncated = bool(max_pages and pages_fetched >= max_pages)
+        if truncated:
+            logger.info(f"【{self.cookie_id}】同步被 max_pages 截断，跳过上下架校准")
+        elif not all_items and not confirmed_empty:
+            logger.warning(
+                f"【{self.cookie_id}】接口未返回任何商品且未确认为空，"
+                f"跳过上下架校准以免误标"
+            )
+        else:
+            from app.db_manager import db_manager
+            stats = db_manager.reconcile_item_listing_status(
+                self.cookie_id, [item.get('id') for item in all_items]
+            )
+            off_shelf_count = stats.get('off_shelf', 0)
+
         return {
             'success': True,
             'total_pages': pages_fetched,
@@ -10900,7 +11300,8 @@ class XianyuLive:
             'count_reconciled': count_reconciled,
             'confirmed_empty': confirmed_empty,
             'group_name': group_name,
-            'account_id': self.myid
+            'account_id': self.myid,
+            'off_shelf_count': off_shelf_count
         }
 
     async def send_image_msg(self, ws, cid, toid, image_url, width=800, height=600, card_id=None):

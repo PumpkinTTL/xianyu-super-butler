@@ -51,7 +51,9 @@ RUN apt-get update && \
         fonts-liberation \
         libgl1 \
         libglib2.0-0 \
-        nodejs && \
+        nodejs \
+        xvfb \
+        x11-utils && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
