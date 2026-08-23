@@ -64,6 +64,7 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 RUN playwright install-deps chromium && \
     playwright install chromium && \
+    python -m patchright install chromium && \
     mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
     chmod 777 /app/logs /app/data /app/backups /app/static/uploads /app/static/uploads/images && \
     chmod +x /app/entrypoint.sh
